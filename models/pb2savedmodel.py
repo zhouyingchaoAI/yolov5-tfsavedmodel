@@ -36,10 +36,10 @@ parser = argparse.ArgumentParser(description='Generate a saved model.')
 
 parser.add_argument("--model_version", default="1", help="Version number of the model.", type=str)
 parser.add_argument("--output_dir", default="../weights/model", help="export model directory", type=str)
-parser.add_argument("--pb_dir", default="../weights/yolov5l_opti.pb", help="Directory where to read training checkpoints.", type=str)
+parser.add_argument("--pb_dir", default="../weights/helmet_opti.pb", help="Directory where to read training checkpoints.", type=str)
 parser.add_argument("--input_tensor", default="encoded_image_tensor:0", help="input tensor", type=str)
 parser.add_argument("--output_tensor", default="Identity:0", help="Concat_383:0", type=str)
-parser.add_argument("--class_num", default=80, help="class num", type=int)
+parser.add_argument("--class_num", default=3, help="class num", type=int)
 
 
 args = parser.parse_args()

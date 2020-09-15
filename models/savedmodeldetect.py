@@ -10,7 +10,7 @@ import colorsys
 
 # tf.disable_v2_behavior()
 # video_path      = "./video/IMG_9142.MP4"
-video_path      = "/home/zyc/Desktop/现场分析视频/2.mp4"
+video_path      = "/home/zyc/Desktop/现场分析视频/192.168.1.101_01_20200914094437397.mp4"
 spp_flag = True
 
 path = '../weights/model/1'
@@ -23,7 +23,6 @@ def load_classes(path):
         names = f.read().split('\n')
     return list(filter(None, names))  # filter removes empty strings (such as last line)
 
-classes_label = load_classes("../data/coco.names")
 
 
 def image_resize(image, width = None, height = None, inter = cv2.INTER_AREA):

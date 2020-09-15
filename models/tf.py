@@ -2,8 +2,11 @@ import argparse
 from copy import deepcopy
 from pathlib import Path
 import sys, traceback
+import os
+import logging
 
 import torch
+import torch.nn as nn
 import tensorflow as tf
 if tf.__version__.startswith('1'):
     tf.enable_eager_execution()
@@ -11,8 +14,15 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
 
-from models.experimental import *
+from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat, autopad
+from models.experimental import MixConv2d, CrossConv, C3
+from utils.general import check_anchor_order, make_divisible, check_file, set_logging
+from utils.torch_utils import (
+    time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, select_device)
 from models.yolo import Detect
+
+
+logger = logging.getLogger(__name__)
 
 
 class tf_BN(keras.layers.Layer):
@@ -26,7 +36,16 @@ class tf_BN(keras.layers.Layer):
                 moving_variance_initializer=keras.initializers.Constant(w.running_var.numpy()))
 
     def call(self, inputs):
-        return self.bn(inputs, training=False)
+        return self.bn(inputs)
+
+
+class tf_Pad(keras.layers.Layer):
+    def __init__(self, pad):
+        super(tf_Pad, self).__init__()
+        self.pad = tf.constant([[0, 0], [pad, pad], [pad, pad], [0, 0]])
+
+    def call(self, inputs):
+        return tf.pad(inputs, self.pad, mode='constant', constant_values=0)
 
 
 class tf_Conv(keras.layers.Layer):
@@ -34,7 +53,8 @@ class tf_Conv(keras.layers.Layer):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, w=None):  # ch_in, ch_out, weights, kernel, stride, padding, groups
         super(tf_Conv, self).__init__()
         assert g == 1, "TF v2.2 Conv2D does not support 'groups' argument"
-        assert s == 1 or s == 2, "Paddings is complicated when s > 2"
+        assert isinstance(k, int), "Convolution with multiple kernels are not allowed."
+
         # TensorFlow convolution padding is inconsistent with PyTorch (e.g. k=3 s=2 'SAME' padding)
         # see https://stackoverflow.com/questions/52975843/comparing-conv2d-with-padding-between-tensorflow-and-pytorch
         if s == 1:
@@ -42,30 +62,23 @@ class tf_Conv(keras.layers.Layer):
                     c2, k, s, 'SAME', use_bias=False,
                     kernel_initializer=
                             keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()))
-        elif s == 2:
+        else:
+            self.pad = tf_Pad(autopad(k, p))
             self.conv = keras.Sequential([
-                    keras.layers.Lambda(lambda x: tf.pad(x, 
-                        tf.constant([[0, 0], [1, 1], [1, 1], [0, 0]]), mode='constant', constant_values=0)),
-                    keras.layers.Conv2D(
-                        c2, k, s, 'VALID', use_bias=False,
-                        kernel_initializer=
-                                keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()))
+                self.pad, 
+                keras.layers.Conv2D(
+                    c2, k, s, 'VALID', use_bias=False,
+                    kernel_initializer=
+                            keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()))
             ])
 
-        # assert isinstance(k, int), "Convolution with multiple kernels are not allowed."
-        # self.pad = autopad(k, p)
-        # self.conv = keras.Sequential([
-        #         keras.layers.Lambda(lambda x: tf.pad(x, 
-        #             tf.constant([[0, 0], [self.pad, self.pad], [self.pad, self.pad], [0, 0]]), 
-        #             mode='constant', constant_values=0)),
-        #         keras.layers.Conv2D(
-        #             c2, k, s, 'VALID', use_bias=False,
-        #             kernel_initializer=
-        #                     keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()))
-        # ])
-        
         self.bn = tf_BN(w.bn)
-        self.act = (lambda x: keras.activations.relu(x, alpha=0.1)) if act else tf.identity
+
+        # YOLOv5 v3 uses Hardswish for activations
+        if isinstance(w.act, nn.LeakyReLU):
+            self.act = (lambda x: keras.activations.relu(x, alpha=0.1)) if act else tf.identity
+        elif isinstance(w.act, nn.Hardswish): 
+            self.act = (lambda x: x * tf.nn.relu6(x+3) / 6) if act else tf.identity
 
     def call(self, inputs):
         return self.act(self.bn(self.conv(inputs)))
@@ -78,9 +91,9 @@ class tf_Focus(keras.layers.Layer):
         self.conv = tf_Conv(c1 * 4, c2, k, s, p, g, act, w.conv)
 
     def call(self, inputs):  # x(b,w,h,c) -> y(b,w/2,h/2,4c)
-        return self.conv(tf.concat([inputs[:, ::2, ::2, :], 
-                                    inputs[:, 1::2, ::2, :], 
-                                    inputs[:, ::2, 1::2, :], 
+        return self.conv(tf.concat([inputs[:, ::2, ::2, :],
+                                    inputs[:, 1::2, ::2, :],
+                                    inputs[:, ::2, 1::2, :],
                                     inputs[:, 1::2, 1::2, :]], 3))
 
 
@@ -97,10 +110,10 @@ class tf_Bottleneck(keras.layers.Layer):
         return inputs + self.cv2(self.cv1(inputs)) if self.add else self.cv2(self.cv1(inputs))
 
 
-class tf_Conv2D(keras.layers.Layer):
+class tf_Conv2d(keras.layers.Layer):
     # Substitution for PyTorch nn.Conv2D
     def __init__(self, c1, c2, k, s=1, g=1, bias=True, w=None):
-        super(tf_Conv2D, self).__init__()
+        super(tf_Conv2d, self).__init__()
         assert g == 1, "TF v2.2 Conv2D does not support 'groups' argument"
         self.conv = keras.layers.Conv2D(
                 c2, k, s, 'VALID', use_bias=bias,
@@ -112,7 +125,7 @@ class tf_Conv2D(keras.layers.Layer):
 
     def call(self, inputs):
         return self.conv(inputs)
-        
+
 
 class tf_BottleneckCSP(keras.layers.Layer):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
@@ -120,8 +133,8 @@ class tf_BottleneckCSP(keras.layers.Layer):
         super(tf_BottleneckCSP, self).__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = tf_Conv(c1, c_, 1, 1, w=w.cv1)
-        self.cv2 = tf_Conv2D(c1, c_, 1, 1, bias=False, w=w.cv2)
-        self.cv3 = tf_Conv2D(c_, c_, 1, 1, bias=False, w=w.cv3)
+        self.cv2 = tf_Conv2d(c1, c_, 1, 1, bias=False, w=w.cv2)
+        self.cv3 = tf_Conv2d(c_, c_, 1, 1, bias=False, w=w.cv3)
         self.cv4 = tf_Conv(2 * c_, c2, 1, 1, w=w.cv4)
         self.bn = tf_BN(w.bn)
         self.act = lambda x: keras.activations.relu(x, alpha=0.1)
@@ -157,14 +170,10 @@ class tf_Detect(keras.layers.Layer):
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [tf.zeros(1)] * self.nl  # init grid
-        # a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         a = tf.reshape(tf.convert_to_tensor(anchors, dtype=tf.float32), [self.nl, -1 ,2])
-        # self.register_buffer('anchors', a)  # shape(nl,na,2)
-        # self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.anchors = tf.Variable(a, trainable=False)
         self.anchor_grid = tf.reshape(tf.Variable(a, trainable=False), [self.nl, 1, -1, 1, 2])
-        # self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        self.m = [tf_Conv2D(x, self.no * self.na, 1, w=w.m[i]) for i, x in enumerate(ch)]
+        self.m = [tf_Conv2d(x, self.no * self.na, 1, w=w.m[i]) for i, x in enumerate(ch)]
         self.export = False  # onnx export
         self.training = True # set to False after building model
         for i in range(self.nl):
@@ -179,16 +188,10 @@ class tf_Detect(keras.layers.Layer):
         for i in range(self.nl):
             x.append(self.m[i](inputs[i]))
             # x(bs,20,20,255) to x(bs,3,20,20,85)
-            # bs, ny, nx = tf.shape(x[i])[0], tf.shape(x[i])[1], tf.shape(x[i])[2]
             ny, nx = opt.img_size[0] // self.stride[i], opt.img_size[1] // self.stride[i]
             x[i] = tf.transpose(tf.reshape(x[i], [-1, ny * nx, self.na, self.no]), [0, 2, 1, 3])
 
             if not self.training:  # inference
-                # Avoid Range and Size op
-                # if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                #     self.grid[i] = self._make_grid(nx, ny)
-
-                # Avoid item assignment
                 y = tf.sigmoid(x[i])
                 xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                 squared = 4 * y[..., 2:4] * y[..., 2:4]
@@ -206,11 +209,11 @@ class tf_Detect(keras.layers.Layer):
         return tf.cast(tf.reshape(tf.stack([xv, yv], 2), [1, 1, ny * nx, 2]), dtype=tf.float32)
 
 
-class tf_UpSample(keras.layers.Layer):
+class tf_Upsample(keras.layers.Layer):
     def __init__(self, size, scale_factor, mode, w=None):
-        super(tf_UpSample, self).__init__()
+        super(tf_Upsample, self).__init__()
         assert scale_factor == 2, "scale_factor must be 2"
-        # self.upsample = keras.layers.UpSampling2D(size=scale_factor, interpolation=mode)  
+        # self.upsample = keras.layers.UpSampling2D(size=scale_factor, interpolation=mode)
         self.upsample = lambda x: tf.image.resize(x, (x.shape[1] * 2, x.shape[2] * 2), method=mode)
 
     def call(self, inputs):
@@ -227,39 +230,15 @@ class tf_Concat(keras.layers.Layer):
         return tf.concat(inputs, self.d)
 
 
-def tf_reflect(m):
-    # print(m.__name__)
-    # print(m)
-    # isinstance returns unexpected results
-    if m in [Focus]:
-        tf_m = tf_Focus
-    elif m in [nn.Conv2d]:
-        tf_m = tf_Conv2D
-    elif m in [Conv]:
-        tf_m = tf_Conv
-    elif m in [Bottleneck]:
-        tf_m = tf_Bottleneck
-    elif m in [BottleneckCSP]:
-        tf_m = tf_BottleneckCSP
-    elif m in [SPP]:
-        tf_m = tf_SPP
-    elif m in [Detect]:
-        tf_m = tf_Detect
-    elif m in [nn.Upsample]:
-        tf_m = tf_UpSample
-    elif m in [Concat]:
-        tf_m = tf_Concat
-    return tf_m
-
-
 def parse_model(d, ch, model):  # model_dict, input_channels(3)
-    print('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
+    logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        m_str = m
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             try:
@@ -287,18 +266,15 @@ def parse_model(d, ch, model):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-
-        m_ = keras.Sequential([tf_reflect(m)(*args, w=model.model[i][j]) for j in range(n)]) if n > 1 \
-                else tf_reflect(m)(*args, w=model.model[i])  # module
+        tf_m = eval('tf_' + m_str.replace('nn.', ''))
+        m_ = keras.Sequential([tf_m(*args, w=model.model[i][j]) for j in range(n)]) if n > 1 \
+                else tf_m(*args, w=model.model[i])  # module
 
         torch_m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
-        # t = str(m)[8:-2].replace('__main__.', '')  # module type
-        t = str(m)
+        t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum([x.numel() for x in torch_m_.parameters()])  # number params
-        # np = sum([x.size for x in m_.get_weights()])  # number params
-        # cannot get np before building keras.Sequential 
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        print('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
+        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         ch.append(c2)
@@ -372,8 +348,6 @@ class tf_Model():
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
-            # print('%d %s output ' % (i, m))
-            # print('x.shape', x.shape)
             y.append(x if m.i in self.savelist else None)  # save output
 
         if profile:
@@ -383,8 +357,8 @@ class tf_Model():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='../models/yolov5l.yaml', help='cfg path')
-    parser.add_argument('--weights', type=str, default='../weights/yolov5l.pt', help='weights path')
+    parser.add_argument('--cfg', type=str, default='../models/yolov5l-helmet.yaml', help='cfg path')
+    parser.add_argument('--weights', type=str, default='../weights/best.pt', help='weights path')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='image size')
     parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     opt = parser.parse_args()
@@ -395,37 +369,15 @@ if __name__ == "__main__":
     img = torch.zeros((opt.batch_size, 3, *opt.img_size))  # image size(1,3,320,192) iDetection
 
     # Load PyTorch model
-    # google_utils.attempt_download(opt.weights)
     model = torch.load(opt.weights, map_location=torch.device('cpu'))['model'].float()
     model.eval()
     model.model[-1].export = False  # set Detect() layer export=True
     y = model(img)  # dry run
     nc = y[0].shape[-1] - 5
 
-    # # TensorFlow saved_model export 
-    # try:
-    #     print('\nStarting TensorFlow saved_model export with TensorFlow %s...' % tf.__version__)
-    #     tf_model = tf_Model(opt.cfg, model=model, nc=nc)
-    #     img = tf.zeros((opt.batch_size, *opt.img_size, 3))  # NHWC Input for TensorFlow
-
-    #     m = tf_model.model.layers[-1]
-    #     assert isinstance(m, tf_Detect), "the last layer must be Detect"
-    #     m.training = False
-    #     y = tf_model.predict(img)
-
-    #     inputs = keras.Input(shape=(*opt.img_size, 3))
-    #     keras_model = keras.Model(inputs=inputs, outputs=tf_model.predict(inputs))
-    #     keras_model.summary()
-    #     path = opt.weights.replace('.pt', '_saved_model')  # filename
-    #     keras_model.save(path, save_format='tf')
-    #     print('TensorFlow saved_model export success, saved as %s' % path)
-    # except Exception as e:
-    #     print('TensorFlow saved_model export failure: %s' % e)
-    #     traceback.print_exc(file=sys.stdout)
-
-    # TensorFlow GraphDef export 
+    # TensorFlow saved_model export
     try:
-        print('\nStarting TensorFlow GraphDef export with TensorFlow %s...' % tf.__version__)
+        print('\nStarting TensorFlow saved_model export with TensorFlow %s...' % tf.__version__)
         tf_model = tf_Model(opt.cfg, model=model, nc=nc)
         img = tf.zeros((opt.batch_size, *opt.img_size, 3))  # NHWC Input for TensorFlow
 
@@ -437,6 +389,18 @@ if __name__ == "__main__":
         inputs = keras.Input(shape=(*opt.img_size, 3))
         keras_model = keras.Model(inputs=inputs, outputs=tf_model.predict(inputs))
         keras_model.summary()
+        path = opt.weights.replace('.pt', '_saved_model')  # filename
+        keras_model.save(path, save_format='tf')
+        print('TensorFlow saved_model export success, saved as %s' % path)
+    except Exception as e:
+        print('TensorFlow saved_model export failure: %s' % e)
+        traceback.print_exc(file=sys.stdout)
+
+    # TensorFlow GraphDef export
+    try:
+        print('\nStarting TensorFlow GraphDef export with TensorFlow %s...' % tf.__version__)
+
+        # https://github.com/leimao/Frozen_Graph_TensorFlow
         full_model = tf.function(lambda x: keras_model(x))
         full_model = full_model.get_concrete_function(
                     tf.TensorSpec(keras_model.inputs[0].shape, keras_model.inputs[0].dtype))
@@ -454,18 +418,18 @@ if __name__ == "__main__":
         print('TensorFlow GraphDef export failure: %s' % e)
         traceback.print_exc(file=sys.stdout)
 
-    # # TFLite model export
-    # try:
-    #     print('\nStarting TFLite export with TensorFlow %s...' % tf.__version__)
-    #     converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
-    #     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-    #     converter.allow_custom_ops = False
-    #     converter.experimental_new_converter = True
-    #     tflite_model = converter.convert()
-    #     f = opt.weights.replace('.pt', '.tflite')  # filename
-    #     open(f, "wb").write(tflite_model)
-    #     print('TFLite export success, saved as %s' % f)
-    # except Exception as e:
-    #     print('TFLite export failure: %s' % e)
-    #     traceback.print_exc(file=sys.stdout)
+    # TFLite model export
+    try:
+        print('\nStarting TFLite export with TensorFlow %s...' % tf.__version__)
+        converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        converter.allow_custom_ops = False
+        converter.experimental_new_converter = True
+        tflite_model = converter.convert()
+        f = opt.weights.replace('.pt', '.tflite')  # filename
+        open(f, "wb").write(tflite_model)
+        print('TFLite export success, saved as %s' % f)
+    except Exception as e:
+        print('TFLite export failure: %s' % e)
+        traceback.print_exc(file=sys.stdout)
 

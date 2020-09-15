@@ -38,8 +38,8 @@ transforms = ['remove_nodes(op=Identity)',
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tf', type=str, default='../weights/yolov5l.pb', help='onnx file path')
-    parser.add_argument('--optf', type=str, default='../weights/yolov5l_opti.pb', help='tf file path')
+    parser.add_argument('--tf', type=str, default='../weights/best.pb', help='onnx file path')
+    parser.add_argument('--optf', type=str, default='../weights/helmet_opti.pb', help='tf file path')
     opt = parser.parse_args()
     output_node_names = ["x", "Identity"]
 
